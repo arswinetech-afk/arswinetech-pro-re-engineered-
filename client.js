@@ -72,6 +72,11 @@ window.ARSCloud = (() => {
 
   const dirtyVersions = new Map();
   const cloudVersions = new Map();
+  /* [FIX C3] Offline-safe delete queue. A delete recorded while offline (or that
+     failed mid-flight) is queued per farm/entity/local-key and retried by the
+     same auto-push loop; rows with a pending delete are never re-uploaded, so a
+     later cloud pull cannot silently resurrect a record the farmer deleted. */
+  const pendingDeletes = new Map(); // key -> {farm_id, entity_type, local_id, queued_at}
   let localMutationVersion = 0;
   let session = null;
   let token = '';
@@ -482,6 +487,38 @@ window.ARSCloud = (() => {
     return dirtyKeysForFarm(farmId).length > 0;
   }
 
+  /* ── pending delete queue (FIX C3) ─────────────────────────────────────── */
+  function deleteKeyFor(farmId, entityType, localId) {
+    return rowKey(farmId, entityType, localId);
+  }
+  function queuePendingDelete(farmId, entityType, localId) {
+    const key = deleteKeyFor(farmId, entityType, localId);
+    if (!pendingDeletes.has(key)) {
+      pendingDeletes.set(key, { farm_id: String(farmId), entity_type: entityType, local_id: String(localId), queued_at: new Date().toISOString() });
+    }
+    return key;
+  }
+  function pendingDeletesForFarm(farmId) {
+    return Array.from(pendingDeletes.values()).filter(d => String(d.farm_id) === String(farmId));
+  }
+  async function flushPendingDeletes(farmId) {
+    const queued = pendingDeletesForFarm(farmId);
+    if (!queued.length) return { deleted: 0, failed: 0, pending: 0 };
+    let deleted = 0, failed = 0;
+    for (const d of queued) {
+      try {
+        await request(`/rest/v1/app_records?farm_id=eq.${encodeURIComponent(d.farm_id)}&entity_type=eq.${encodeURIComponent(d.entity_type)}&local_id=eq.${encodeURIComponent(d.local_id)}`, { method: 'DELETE' }, { requireAuth: true });
+        pendingDeletes.delete(deleteKeyFor(d.farm_id, d.entity_type, d.local_id));
+        deleted++;
+      } catch (error) {
+        /* network failure keeps the row queued; auth errors surface on the next
+           session restore instead of blocking the whole farm flush. */
+        failed++;
+      }
+    }
+    return { deleted, failed, pending: pendingDeletesForFarm(farmId).length };
+  }
+
   function saveLocalRecovery(farmId, farm, reason = 'cloud-authoritative pull') {
     if (!farm || typeof farm !== 'object') return false;
     const hasRecords = Object.values(entityMap).some(type => {
@@ -649,6 +686,16 @@ window.ARSCloud = (() => {
     }
     if (window.__arsCloudBaselineReady !== true && options.allowUninitialized !== true) {
       return { success: false, reason: 'Cloud baseline is not verified; local data was not uploaded.' };
+    }
+
+    // FIX C3: try the offline delete queue first, and never re-upload a row
+    // that is still pending deletion (it would resurrect on the next pull).
+    const queuedDeletes = pendingDeletesForFarm(farmId);
+    if (queuedDeletes.length) {
+      const flush = await flushPendingDeletes(farmId);
+      if (flush.failed > 0 && flush.pending > 0) {
+        return { success: false, reason: `${flush.pending} deletion(s) still waiting for cloud connectivity; upload paused so deleted records cannot return.`, pending: true, deletionsPending: flush.pending };
+      }
     }
 
     const onlyKeys = options.dirtyOnly === false ? null : new Set(dirtyKeysForFarm(farmId));
@@ -916,19 +963,60 @@ window.ARSCloud = (() => {
   async function purgeTestAccounts() {
     return request('/rest/v1/rpc/platform_purge_test_accounts', { method: 'POST', body: '{}' }, { requireAuth: true });
   }
+  /* FIX C3: deletes are now offline-safe. A failed network delete is queued and
+     retried by the auto-push loop; the caller's .catch(() => {}) remains safe
+     because we only rethrow after the row was queued (or for auth errors, which
+     the queue would never be able to flush either and the caller should see). */
   async function deleteAppRecord(farmId, entityType, localId) {
-    if (!farmId || !entityType || !localId) return;
-    await request(`/rest/v1/app_records?farm_id=eq.${encodeURIComponent(farmId)}&entity_type=eq.${encodeURIComponent(entityType)}&local_id=eq.${encodeURIComponent(localId)}`, { method: 'DELETE' }, { requireAuth: true });
+    if (!farmId || !entityType || !localId) return { success: false, reason: 'Missing delete key.' };
+    try {
+      await request(`/rest/v1/app_records?farm_id=eq.${encodeURIComponent(farmId)}&entity_type=eq.${encodeURIComponent(entityType)}&local_id=eq.${encodeURIComponent(localId)}`, { method: 'DELETE' }, { requireAuth: true });
+      pendingDeletes.delete(deleteKeyFor(farmId, entityType, localId));
+      return { success: true };
+    } catch (error) {
+      queuePendingDelete(farmId, entityType, localId);
+      if (error.status === 401) throw error; // auth problems need user attention
+      return { success: false, reason: error.message || String(error), queued: true };
+    }
   }
 
   async function deleteAppRecordsBatch(farmId, entityType, localIds) {
     const ids = Array.from(new Set((localIds || []).map(id => String(id || '').trim()).filter(Boolean)));
     if (!farmId || !entityType || !ids.length) return { success: false, reason: 'A farm, entity type, and selected IDs are required.' };
-    const deleted = await request('/rest/v1/rpc/platform_delete_app_records', {
-      method: 'POST',
-      body: JSON.stringify({ p_farm_id: farmId, p_entity_type: entityType, p_local_ids: ids })
-    }, { requireAuth: true });
-    return { success: true, deleted: Number(deleted || 0), ids };
+    try {
+      const deleted = await request('/rest/v1/rpc/platform_delete_app_records', {
+        method: 'POST',
+        body: JSON.stringify({ p_farm_id: farmId, p_entity_type: entityType, p_local_ids: ids })
+      }, { requireAuth: true });
+      ids.forEach(id => pendingDeletes.delete(deleteKeyFor(farmId, entityType, id)));
+      return { success: true, deleted: Number(deleted || 0), ids };
+    } catch (error) {
+      ids.forEach(id => queuePendingDelete(farmId, entityType, String(id)));
+      if (error.status === 401) throw error;
+      return { success: false, reason: error.message || String(error), queued: true, ids };
+    }
+  }
+
+  /* ── conflict review helpers (FIX C2) ─────────────────────────────────────
+     The engine blocks stale writes (safe), but the only previous escape was an
+     allowDirty pull that silently discarded the local edit. These helpers give
+     the review UI two explicit choices:
+       'local'  → adopt the remote version as the new baseline (so the preflight
+                  stops flagging it) and keep the local edit dirty; the caller
+                  then re-pushes and the local value wins deliberately.
+       'remote' → drop the dirty flag so a pull may replace the local value. */
+  function resolveConflict(farmId, conflict, mode = 'local') {
+    const key = rowKey(farmId, conflict.entity_type, conflict.local_id);
+    if (mode === 'remote') {
+      dirtyVersions.delete(key);
+      return { success: true, mode, key };
+    }
+    cloudVersions.set(key, { updated_at: conflict.remote_updated_at || cloudVersions.get(key)?.updated_at || new Date().toISOString() });
+    return { success: true, mode, key };
+  }
+  function discardDirtyConflicts(farmId, conflicts) {
+    (conflicts || []).forEach(c => dirtyVersions.delete(rowKey(farmId, c.entity_type, c.local_id)));
+    return true;
   }
 
   async function cleanCloudTestRecords(farmId) {
@@ -988,6 +1076,10 @@ window.ARSCloud = (() => {
     dirtyKeysForFarm,
     saveLocalRecovery,
     listLocalRecoverySnapshots,
+    resolveConflict,
+    discardDirtyConflicts,
+    flushPendingDeletes,
+    pendingDeletesForFarm,
     configured: () => Boolean(c?.url && c?.anonKey),
     entityMap: () => ({ ...entityMap }),
     typeToKey: () => ({ ...typeToKey })

@@ -32,7 +32,7 @@
     const out = [];
     const ids = new Set();
     const signatures = new Set();
-    source.filter(t => t && typeof t === 'object' && !['voided', 'deleted', 'undone'].includes(String(t.status || '').toLowerCase())).forEach((t, index) => {
+    source.filter(t => t && typeof t === 'object' && !['voided', 'deleted', 'undone', 'applied'].includes(String(t.status || '').toLowerCase())).forEach((t, index) => {
       const normalized = { ...t, _index: index, _source: 'transaction', amount: num(t.amount), paid: num(t.paid), month: monthOf(t.date || t.created_at) || isoMonth(new Date()) };
       if (normalized.id) ids.add(String(normalized.id));
       signatures.add(financialSignature(normalized));
@@ -57,16 +57,29 @@
   }
 
   function textOf(t) { return `${t.category || ''} ${t.description || ''}`.toLowerCase(); }
+  /* [FIX M4] the old matcher required the description to contain the
+     reservation "no id" string joined together, so it could NEVER match (release
+     descriptions carry only the reservation number) — deposits stayed "held"
+     forever and cash double-counted at release. Match no OR id separately. */
+  function depositReservation(t, farm) {
+    const text = textOf(t);
+    if (!/reservation prepayment|floating reservation deposit|customer deposit/.test(text)) return null;
+    const parts = (r) => [r.no, r.id].filter(Boolean).map(x => String(x).toLowerCase().trim()).filter(Boolean);
+    return (farm.reservations || []).find(r => r && parts(r).some(p => text.includes(p))) || null;
+  }
   function isCustomerDeposit(t, farm) {
     const text = textOf(t);
     if (!/reservation prepayment|floating reservation deposit|customer deposit/.test(text)) return false;
-    const reservation = (farm.reservations || []).find(r => {
-      const hay = `${r.no || ''} ${r.id || ''}`.toLowerCase();
-      return hay && text.includes(hay);
-    });
-    // A released reservation is recognized as earned by its release sale; its
-    // earlier deposit must not be counted a second time.
+    const reservation = depositReservation(t, farm);
+    // Held liability only while the reservation is still open/floating; a
+    // released reservation is recognized by its release entry (and the
+    // prepayment is marked 'applied'), a cancelled one was refunded. Legacy
+    // deposits without a matching reservation stay held (never counted twice).
     return reservation ? !['released', 'cancelled'].includes(String(reservation.status || '').toLowerCase()) : true;
+  }
+  function isAppliedDeposit(t, farm) {
+    const reservation = depositReservation(t, farm);
+    return Boolean(reservation) && ['released', 'cancelled'].includes(String(reservation.status || '').toLowerCase());
   }
   function isMortality(t) { return /mortality|death|livestock loss|piglet loss/.test(textOf(t)); }
   function isFeed(t) { return /feed|ration|corn|maize|soy|ingredient|premix/.test(textOf(t)); }
@@ -102,7 +115,12 @@
   }
 
   function transactionSummary(farm) {
-    const tx = records(farm);
+    /* [FIX M4] deposits applied to a released/cancelled reservation never enter
+       the operating figures (the release entry is the revenue) and no longer sit
+       in the held-liabilities bucket either. */
+    const allTx = records(farm);
+    const appliedDeposits = allTx.filter(t => t.type === 'Income' && isAppliedDeposit(t, farm));
+    const tx = allTx.filter(t => !appliedDeposits.includes(t));
     const mortality = mortalitySummary(farm);
     const expenses = tx.filter(t => t.type === 'Expense');
     const income = tx.filter(t => t.type === 'Income');

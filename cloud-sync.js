@@ -179,10 +179,14 @@
         const reason = String(res?.reason || '');
         const conflict = Boolean(res?.conflicts?.length) || /remote changes detected|conflict|farm context changed/i.test(reason);
         if (res && res.success === false) {
-          if (conflict) {
+          if (conflict && res?.conflicts?.length) {
             // A real remote conflict must stop automatic retries. The local
-            // value stays dirty and preserved for review; nothing is overwritten.
+            // value stays dirty and preserved; the review sheet lets the
+            // manager decide instead of silently losing either side (FIX C2).
             updateSyncIndicator('error', 'Review needed', reason || 'Remote changes were detected; no local row was overwritten.');
+            openConflictReview(fId, res.conflicts);
+          } else if (conflict) {
+            updateSyncIndicator('error', 'Review needed', reason || 'Farm context changed; no row was overwritten.');
           } else {
             updateSyncIndicator('pending', 'Pending changes', reason || 'Cloud write failed; a safe retry is scheduled.');
             queueSafeRetry(15000);
@@ -392,6 +396,94 @@
     `);
   }
 
+  /* ═══════════════════════════════════════════════════════════════════════
+     FIX C2 — CONFLICT REVIEW SHEET
+     Previously a two-device edit deadlocked the safe engine with no way out
+     except an allowDirty pull that silently replaced the local value. This
+     sheet shows every conflicting row and offers explicit choices:
+       • Keep my copy   → adopts the remote version as the baseline, keeps the
+                          local edit dirty, then re-pushes (local wins by choice)
+       • Use cloud      → drops the local dirty flag; the cloud version wins on
+                          the next refresh (local copy stays in recovery data)
+       • Export both    → downloads farm JSON (local + recovery) before deciding
+     ═══════════════════════════════════════════════════════════════════════ */
+  function openConflictReview(fId, conflicts) {
+    if (!Array.isArray(conflicts) || !conflicts.length) return;
+    document.getElementById('conflictReviewModal')?.remove();
+    const rows = conflicts.map((c, i) => `
+      <div class="conflict-row" style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;background:rgba(239,68,68,0.05)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div>
+            <b style="font-size:12.5px">${esc(c.entity_type || 'record')} · ${esc(c.local_id || 'row')}</b>
+            <small class="muted" style="display:block">Changed on another device at ${esc(c.remote_updated_at || '—')} — your local edit is preserved.</small>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button type="button" class="btn small" onclick="resolveConflictRow(${i},'local')">📱 Keep mine</button>
+            <button type="button" class="btn ghost small" onclick="resolveConflictRow(${i},'remote')">☁ Use cloud</button>
+          </div>
+        </div>
+      </div>`).join('');
+    document.body.insertAdjacentHTML('beforeend', `
+      <div class="due-modal-bg open" id="conflictReviewModal" style="z-index:1000001!important">
+        <div class="due-modal" style="max-width:620px;width:96%">
+          <div class="modal-top">
+            <div>
+              <div class="eyebrow" style="color:#f87171">⚠ SYNC CONFLICT · REVIEW REQUIRED</div>
+              <h2 style="margin:2px 0 4px">${conflicts.length} record(s) changed on two devices</h2>
+              <small class="muted">Nothing was overwritten. Choose what this farm should keep. Your local copy also stays in the recovery backup.</small>
+            </div>
+            <button type="button" class="close-reminder" onclick="document.getElementById('conflictReviewModal').remove()">×</button>
+          </div>
+          <div style="margin:14px 0;max-height:46vh;overflow:auto">${rows}</div>
+          <div class="due-actions" style="justify-content:space-between;flex-wrap:wrap">
+            <button type="button" class="btn ghost small" onclick="exportFarmJSON()">📥 Export farm backup first</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button type="button" class="btn ghost" onclick="resolveAllConflicts(${JSON.stringify(conflicts).replace(/"/g, '&quot;')},'remote')">☁ Use cloud for all</button>
+              <button type="button" class="btn" onclick="resolveAllConflicts(${JSON.stringify(conflicts).replace(/"/g, '&quot;')},'local')">📱 Keep mine for all</button>
+            </div>
+          </div>
+          <p class="muted" style="font-size:11px;margin-top:8px">Conflict data is never merged automatically; this is a deliberate one-time resolution. The sync indicator will return to Synced afterwards.</p>
+        </div>
+      </div>`);
+    window.__arsConflictList = conflicts;
+  }
+  window.openConflictReview = openConflictReview;
+
+  function resolveConflictRow(i, mode) {
+    const list = window.__arsConflictList || [];
+    const c = list[i];
+    if (!c) return;
+    if (window.ARSCloud?.resolveConflict) window.ARSCloud.resolveConflict(window.__arsActiveFarmId || window.farmId, c, mode);
+    list[i]._resolved = mode;
+    const btn = document.querySelectorAll('#conflictReviewModal .conflict-row')[i];
+    if (btn) btn.style.opacity = '0.45';
+  }
+  window.resolveConflictRow = resolveConflictRow;
+
+  async function resolveAllConflicts(conflicts, mode) {
+    const fId = window.__arsActiveFarmId || window.farmId;
+    const list = window.__arsConflictList || [];
+    if (!window.ARSCloud?.resolveConflict) return;
+    (Array.isArray(conflicts) && conflicts.length ? conflicts : list).forEach(c => {
+      window.ARSCloud.resolveConflict(fId, c, mode);
+    });
+    window.__arsConflictList = [];
+    document.getElementById('conflictReviewModal')?.remove();
+    if (window.ARSCloud?.saveLocalRecovery) ARSCloud.saveLocalRecovery(fId, window.DB?.[fId], 'conflict resolution snapshot before apply');
+    if (mode === 'local') {
+      toast(`📱 Applying your local values (${(Array.isArray(conflicts) ? conflicts : list).length} row(s))…`);
+      await manualSyncNow('push');
+      await performBackgroundPull(false);
+    } else {
+      toast(`☁ Applying cloud values… your local copies remain in recovery backup.`);
+      await ARSCloud.pullFarm(fId, { allowDirty: true });
+      if (window.renderAll) window.renderAll();
+      updateSyncIndicator('synced', 'Synced', 'Cloud version applied after conflict review.');
+      if (window.ARSCloud?.hasDirtyChanges?.(fId)) scheduleAutoPush(400);
+    }
+  }
+  window.resolveAllConflicts = resolveAllConflicts;
+
   async function manualSyncNow(mode = 'pull') {
     const fId = window.__arsActiveFarmId || window.farmId;
     const farm = fId && window.DB ? window.DB[fId] : null;
@@ -407,6 +499,9 @@
       if (res && res.success !== false) {
         toast(`✓ Verified ${res.count || 0} changed records with the cloud.`);
         updateSyncIndicator(res.pending ? 'pending' : 'synced', res.pending ? 'Pending changes' : 'Synced');
+      } else if (res?.conflicts?.length) {
+        openConflictReview(fId, res.conflicts);
+        toast(`⚠️ ${res.conflicts.length} record(s) changed on another device — nothing was overwritten.`);
       } else {
         toast(`⚠️ Cloud write blocked: ${res?.reason || 'Check internet'}`);
         updateSyncIndicator('error', 'Review needed');

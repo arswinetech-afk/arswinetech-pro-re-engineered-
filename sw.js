@@ -5,7 +5,7 @@
 //     script could run against a brand-new index.html (old JS + new DOM = boot crashes).
 //   • Icons / images / fonts      → cache-first (content rarely changes).
 //   • Bump CACHE_NAME on every release; activate() purges older caches.
-const CACHE_NAME = 'arswinetech-pro-v107-feed-consumption-sync-2026-08-23';
+const CACHE_NAME = 'arswinetech-pro-v108-fixes-2026-08-25';
 const APP_SHELL = [
   './',
   './index.html',
@@ -47,6 +47,10 @@ const APP_SHELL = [
   './js/production-control.js',
   './js/collapsible-content.js',
   './js/batch-delete.js',
+  './js/foster-batch.js',
+  './js/ai-vet-search.js',
+  './js/sow-monitoring.js',
+  './js/zxing.min.js',
   './js/register-sw.js',
   './supabase/config.js',
   './supabase/client.js',

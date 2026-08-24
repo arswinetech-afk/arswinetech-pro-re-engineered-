@@ -51,8 +51,17 @@ window.__arsLastSavedFarmById = window.__arsLastSavedFarmById || {};
 window.__arsPendingUnverifiedSave = false;
 window.__arsDirectCloudVerification = 0;
 /* [REBUILD] The original pinned all date math to a hardcoded TODAY = '2026-07-21' (demo snapshot).
-   A working copy needs the real clock; seed data still renders sensible dashboards. */
-const TODAY = new Date().toISOString().slice(0, 10),
+   A working copy needs the real clock; seed data still renders sensible dashboards.
+   [FIX M2] TODAY must be the Manila wall-clock date. (window.localToday ? window.localToday() : new Date().toISOString().slice(0,10))
+   is UTC, which between 00:00-08:00 (+08:00) shows YESTERDAY on the farm floor. */
+function localToday(value = new Date()) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+window.localToday = localToday;
+const TODAY = localToday(),
   d = s => {
     if (!s) return new Date();
     const str = String(s).trim();
@@ -881,6 +890,46 @@ function crudPage(k) {
   document.getElementById(k).innerHTML = `${extra}<div class="toolbar"><div class="toolbar-left"><input class="search" placeholder="Search ${c.title.toLowerCase()}" oninput="filterTable('${k}',this.value)"></div><button class="btn" onclick="openModal('${k}')">+ ${c.add}</button></div><div class="panel table-wrap"><table class="table" id="table-${k}"><thead><tr>${headers.map(x=>`<th>${x}</th>`).join('')}<th></th></tr></thead><tbody>${rows.map(r=>{const rowIndex=r.at(-1);return `<tr${batchDeleteRowAttrs(k,data[rowIndex],rowIndex)}>${r.slice(0,-1).map(x=>`<td>${x}</td>`).join('')}<td class="right">${k==='sows'?`<button class="btn ghost" onclick="openSowProfile(${rowIndex})">Profile</button> `:''}<button class="btn ghost" onclick="editRecord('${k}',${rowIndex})">Edit</button> <button class="btn ghost delete-action" onclick="deleteRecord('${k}',${rowIndex})">Delete</button>${k==='pos'?` <button class="btn ghost" onclick="toggleReturn(${rowIndex})">Return</button>`:''}</td></tr>`}).join('')||`<tr><td colspan="9" class="empty">No records in this farm yet.</td></tr>`}</tbody></table></div>`
 }
 
+/* [FIX FEED PREDICTOR] Stage & departure-aware feed forecast.
+   The old engine counted every batch's heads through age 180 no matter what, so
+   fatteners that go to market at 160 days (and breeders released at 90 days)
+   kept "eating" for up to 20 extra days inside the chosen horizon — Grower and
+   Finisher bags were over-stated once those pigs had already left the farm.
+   Now each batch is split into living pools (fattener / breeder / farm-use /
+   unassigned) via the authoritative count engine, and each pool stops consuming
+   when its scheduled departure day is reached:
+     • fattener heads leave at 160 days of age (market, matches production());
+     • breeder heads leave at 90 days of age (release, matches production());
+     • farm-use & unassigned have no scheduled departure (finisher window caps
+       the very old at 180 days as before).
+   Grower bags are therefore only computed for days a head is actually alive AND
+   inside the day 71-120 grower stage. */
+function feedPoolsForBatch(b) {
+  if (window.getPigletCounts && typeof window.getPigletCounts === 'function') {
+    try {
+      const c = window.getPigletCounts(b);
+      if (c && typeof c === 'object') {
+        return {
+          fattener: Math.max(0, +c.fattener || 0),
+          breeder: Math.max(0, +c.breeder || 0),
+          farm: Math.max(0, +c.farm || 0),
+          unassigned: Math.max(0, +c.availableAll || 0)
+        };
+      }
+    } catch (_) { /* fall through to legacy estimate */ }
+  }
+  const ledger = (F().pigletLedger || []).filter(x => String(x.batch_id) === String(b.id) && !['undone', 'deleted', 'voided'].includes(String(x.status || '').toLowerCase()));
+  const sum = t => ledger.filter(x => x.type === t).reduce((a, x) => a + (+x.quantity || 0), 0);
+  const born = (+b.males || 0) + (+b.females || 0);
+  return { fattener: 0, breeder: 0, farm: 0, unassigned: Math.max(0, born - sum('mortality') - sum('sold')) };
+}
+function feedStageForAge(age) {
+  if (age <= 30) return 'Pre Starter';
+  if (age <= 70) return 'Starter';
+  if (age <= 120) return 'Grower';
+  return 'Finisher';
+}
+
 function feedForecast(period = 30) {
   const f = F();
   const todayStr = (typeof TODAY !== 'undefined' ? TODAY : new Date().toISOString().slice(0, 10));
@@ -909,32 +958,23 @@ function feedForecast(period = 30) {
     'Lactating': { heads: 0, sows: 0 }
   };
 
+  const DEPART_AGE = { fattener: 160, breeder: 90 }; /* market / breeder release (birth + N days) */
+  const MAX_AGE = 180; /* no scheduled departure: keep the old cap for farm-use/unassigned */
+  const RATES = { 'Pre Starter': 0.35, 'Starter': 1.10, 'Grower': 2.10, 'Finisher': 2.75 };
+
   const activeBatches = (f.piglets || []).filter(b => !b.archived && !b.deleted_at);
   const activeSows = (f.sows || []).filter(isActiveSow);
   const activeBoars = (f.boars || []).filter(b => String(b.status || 'Active') === 'Active');
 
-  // Count current population eating each feed today
+  // Count current population eating each feed today (pool-aware, sold already removed)
   activeBatches.forEach(b => {
     const age = days(b.birth);
-    const ledger = f.pigletLedger || [];
-    const dead = ledger.filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0);
-    const sold = ledger.filter(x => x.batch_id === b.id && x.type === 'sold' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0);
-    const h = Math.max(0, (+b.males || 0) + (+b.females || 0) - dead - sold);
-    if (h <= 0) return;
-
-    if (age <= 30) {
-      consumingGroups['Pre Starter'].heads += h;
-      consumingGroups['Pre Starter'].batches.push({ id: b.id, age, heads: h, breed: b.breed });
-    } else if (age <= 70) {
-      consumingGroups['Starter'].heads += h;
-      consumingGroups['Starter'].batches.push({ id: b.id, age, heads: h, breed: b.breed });
-    } else if (age <= 120) {
-      consumingGroups['Grower'].heads += h;
-      consumingGroups['Grower'].batches.push({ id: b.id, age, heads: h, breed: b.breed });
-    } else {
-      consumingGroups['Finisher'].heads += h;
-      consumingGroups['Finisher'].batches.push({ id: b.id, age, heads: h, breed: b.breed });
-    }
+    const pools = feedPoolsForBatch(b);
+    const batchHeads = Object.values(pools).reduce((a, h) => a + h, 0);
+    if (batchHeads <= 0) return;
+    const stage = feedStageForAge(age);
+    consumingGroups[stage].heads += batchHeads;
+    consumingGroups[stage].batches.push({ id: b.id, age, heads: batchHeads, breed: b.breed, pools });
   });
 
   activeSows.forEach(s => {
@@ -953,24 +993,22 @@ function feedForecast(period = 30) {
 
   // Day-by-day progression simulation across the forecast horizon
   for (let dayOffset = 0; dayOffset < period; dayOffset++) {
-    // 1. Batches day-by-day stage transition
+    // 1. Batches day-by-day stage transition — pool by pool, removing heads on
+    //    their scheduled market (fattener, d160) / breeder release (d90) day so
+    //    bags are never computed for animals already off the farm.
     activeBatches.forEach(b => {
-      const ledger = f.pigletLedger || [];
-      const dead = ledger.filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0);
-      const sold = ledger.filter(x => x.batch_id === b.id && x.type === 'sold' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0);
-      const h = Math.max(0, (+b.males || 0) + (+b.females || 0) - dead - sold);
-      if (h <= 0) return;
-
       const simAge = days(b.birth) + dayOffset;
-      if (simAge >= 5 && simAge <= 30) {
-        totals['Pre Starter'] += h * 0.35; // 350g/head/day prestarter
-      } else if (simAge >= 31 && simAge <= 70) {
-        totals['Starter'] += h * 1.10; // 1.1kg/head/day starter
-      } else if (simAge >= 71 && simAge <= 120) {
-        totals['Grower'] += h * 2.10; // 2.1kg/head/day grower
-      } else if (simAge >= 121 && simAge <= 180) {
-        totals['Finisher'] += h * 2.75; // 2.75kg/head/day finisher
-      }
+      const pools = feedPoolsForBatch(b);
+      Object.entries(pools).forEach(([pool, heads]) => {
+        const h = Math.max(0, +heads || 0);
+        if (h <= 0) return;
+        const depart = DEPART_AGE[pool];
+        if (depart && simAge >= depart) return;               // off the farm this day
+        if (!depart && simAge > MAX_AGE) return;               // legacy cap for stayers
+        if (simAge < 5 || simAge > MAX_AGE) return;            // grain-off window & cap
+        const stage = feedStageForAge(simAge);
+        totals[stage] += h * RATES[stage];
+      });
     });
 
     // 2. Sows day-by-day transition (Day 110 gestating -> lactating)
@@ -1159,7 +1197,7 @@ function predictor(period = 30) {
         <span style="font-size:18px">📊</span>
         <div>
           <b>Real-Time Population &amp; Consumption Pattern Analysis</b>
-          <small class="muted" style="display:block">Simulates daily age progression across <b>${sim.activeBatches.length} active litters</b> (${totalPigletsHeads} heads) + <b>${sim.activeSows.length} sows</b> (switching to Lactating feed at Day 110) + <b>${sim.activeBoars.length} boars</b>.</small>
+          <small class="muted" style="display:block">Simulates daily age progression across <b>${sim.activeBatches.length} active litters</b> (${totalPigletsHeads} heads) + <b>${sim.activeSows.length} sows</b> (switching to Lactating feed at Day 110) + <b>${sim.activeBoars.length} boars</b>. Fattener-assigned heads leave the simulation at <b>market day 160</b> and breeder-assigned heads at <b>release day 90</b>, so bags are never projected for animals already sold within the horizon.</small>
         </div>
       </div>
       ${criticalAlertCount > 0 ? `
@@ -1341,7 +1379,9 @@ function production(periodOverride) {
   // 2. 🍼 Scheduled Weaning Events
   (f.piglets || []).forEach(b => {
     if (b.archived || b.weaning || !b.birth) return;
-    const weanDate = isoOff(days(b.birth) + 28);
+    /* [FIX H1] weaning is exactly birth + 28 days — isoOff(days(birth)+28) added
+       the batch's current age twice, pushing the event ~2×age days into the future. */
+    const weanDate = addDaysToDate(b.birth, 28);
     const diff = daysDiff(weanDate);
     const ageDays = Math.max(0, days(b.birth));
     const liveHeads = (Number(b.males || 0) + Number(b.females || 0));
@@ -1418,7 +1458,9 @@ function production(periodOverride) {
     const ageDays = Math.max(0, days(b.birth));
 
     if (fattenerHeads > 0) {
-      const mktDate = isoOff(days(b.birth) + 160);
+      /* [FIX H1] market target is exactly birth + 160 days (the feed predictor
+         and release flows use the same 160d convention). */
+      const mktDate = addDaysToDate(b.birth, 160);
       const diff = daysDiff(mktDate);
 
       rawEvents.push({

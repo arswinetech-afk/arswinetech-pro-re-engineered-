@@ -29,7 +29,9 @@
       .reduce((a, x) => a + (+x.quantity || 0), 0);
   }
 
-  const aliveHeadcount = b => Math.max(0, (+b.males || 0) + (+b.females || 0) - ledgerMortality(b));
+  /* [FIX M1] ADG/performance context uses the same living-headcount as the
+     dashboard & ledger (sold/released excluded), not born − mortality. */
+  const aliveHeadcount = b => window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) - ledgerMortality(b));
 
   /* Compute the full metric set for a batch. Pass the reservation `r` when
      rendering a certificate so measured release data (weight/date) of that

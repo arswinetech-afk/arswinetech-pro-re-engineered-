@@ -1,0 +1,6 @@
+{
+  "name": "arswinetech-qa",
+  "private": true,
+  "type": "module",
+  "dependencies": { "jsdom": "^24.0.0" }
+}

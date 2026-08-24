@@ -111,7 +111,9 @@
        they no longer count in the order projection. */
     const batchSec = [];
     (F().piglets || []).filter(b => !b.archived).forEach(b => {
-      const heads = Math.max(0, (+b.males || 0) + (+b.females || 0) -
+      /* [FIX M1] live headcount from the authoritative ledger engine
+         (sold/released heads are no longer fed in the plan). */
+      const heads = window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) -
         (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0)),
         cons = ((p.batches || {})[b.id] || {}).consumed || {},
         stageData = STAGES.map(([key, label]) => {
@@ -162,8 +164,9 @@
   function batchFeedChip(b) {
     const p = plan();
     if (!p.configured || !b || b.archived) return null;
-    const heads = Math.max(0, (+b.males || 0) + (+b.females || 0) -
-      (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
+    /* [FIX M1] live headcount from the authoritative ledger engine (sold/released heads are no longer fed in the plan). */
+      const heads = window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) -
+        (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
     if (heads <= 0) return null;
     const cons = ((p.batches || {})[b.id] || {}).consumed || {},
       stageData = STAGES.map(([key, label]) => {
@@ -371,8 +374,9 @@
   function renderBatchStagePlannerHTML(b) {
     if (!b || b.archived) return '';
     const p = plan();
-    const heads = Math.max(0, (+b.males || 0) + (+b.females || 0) -
-      (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
+    /* [FIX M1] live headcount from the authoritative ledger engine (sold/released heads are no longer fed in the plan). */
+      const heads = window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) -
+        (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
     if (heads <= 0) return '';
 
     const cons = ((p.batches || {})[b.id] || {}).consumed || {};

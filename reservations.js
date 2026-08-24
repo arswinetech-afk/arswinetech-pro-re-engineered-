@@ -21,19 +21,40 @@
   };
   const escAttr = v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+  /* [FIX H3] The old picker computed "alive − assigned" from born mortality
+     counts and IGNORED sold/released heads, so it showed pigs that had already
+     left the farm as bookable. It also showed the global unassigned count while
+     reservations actually draw from an assigned pool, so displayed and validated
+     numbers disagreed. We now use the authoritative count engine (sold-aware)
+     and report the best pool a customer can reserve from for each gender. */
   const available = b => {
+    if (window.getPigletCounts && typeof window.getPigletCounts === 'function') {
+      try {
+        const c = window.getPigletCounts(b);
+        if (c && typeof c === 'object') {
+          const best = (g) => Math.max(
+            g === 'male' ? (c.breederAvailM || 0) : (c.breederAvailF || 0),
+            g === 'male' ? (c.fattenerAvailM || 0) : (c.fattenerAvailF || 0),
+            g === 'male' ? (c.farmAvailM || 0) : (c.farmAvailF || 0)
+          );
+          const headerM = Math.max(best('male'), c.availableM || 0);
+          const headerF = Math.max(best('female'), c.availableF || 0);
+          return { m: headerM, f: headerF, byCounts: c };
+        }
+      } catch (_) { /* fall through to conservative fallback */ }
+    }
+    /* Legacy fallback (no ledger engine): worst case treat sold as still present
+       so the manager can never over-book. */
     let l = (F().pigletLedger || []).filter(x => x.batch_id === b.id && !['undone', 'deleted', 'voided'].includes(String(x.status || '').toLowerCase())),
       m = +b.males || 0,
       f = +b.females || 0,
       sum = (type, gender) => l.filter(x => x.type === type && (gender === "all" || x.gender === gender)).reduce((a, x) => a + (+x.quantity || 0), 0);
-
     const calcAvail = g => {
-      const alive = (g === "male" ? m : f) - sum("mortality", g);
+      const alive = (g === "male" ? m : f) - sum("mortality", g) - sum("sold", g);
       const assigned = sum("breeder", g) + sum("fattener", g) + sum("farm_use", g);
       const unassignedRes = l.filter(x => x.type === "reserved" && x.source === "unassigned" && x.gender === g).reduce((a, x) => a + (+x.quantity || 0), 0);
       return Math.max(0, alive - assigned - unassignedRes);
     };
-
     return {
       m: calcAvail("male"),
       f: calcAvail("female")
@@ -754,6 +775,30 @@
 
     const allocateQty = Math.min(needed, Math.max(1, availableHeads));
 
+    /* [FIX H4] Partial allocation: the ledger now books only the heads that were
+       actually available. Before this fix r.quantity stayed at the original
+       (larger) request, so the subsequent release booked MORE heads as sold than
+       were ever reserved. Shrink the reservation to the allocated quantity
+       (proportionally across lines) and keep the remainder noted for a new
+       reservation. */
+    if (allocateQty < needed) {
+      const ratio = allocateQty / needed;
+      if (Array.isArray(r.lines) && r.lines.length) {
+        let accounted = 0;
+        r.lines.forEach((L, i) => {
+          if (i === r.lines.length - 1) L.quantity = Math.max(0, allocateQty - accounted);
+          else { L.quantity = Math.max(0, Math.round(L.quantity * ratio)); accounted += L.quantity; }
+        });
+        r.lines = r.lines.filter(L => L.quantity > 0);
+      }
+      r.quantity = allocateQty;
+      const newTotal = r.lines.reduce((a, L) => a + (L.quantity || 0) * (L.price || 0), 0);
+      if (newTotal > 0) r.total = newTotal;
+      r.balance = Math.max(0, (+r.total || 0) - (+r.paid || 0));
+      r.notes = `[SLOT PARTIALLY ALLOCATED] ${r.notes ? r.notes + ' · ' : ''}Only ${allocateQty} of ${needed} head(s) were available; the unallocated ${needed - allocateQty} head(s) remain in the pool for re-reservation.`;
+      toast(`⚠️ Only ${allocateQty} of ${needed} head(s) were available — reservation reduced to ${allocateQty}.`);
+    }
+
     // Convert floating to active confirmed reservation
     r.is_floating = false;
     r.status = r.paid >= r.total ? 'fully_paid' : (r.paid > 0 ? 'partially_paid' : 'pending');
@@ -1011,7 +1056,7 @@
               <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center">
                 <small style="color:var(--muted);font-size:10px">Recorded batch vaccines:</small>
                 ${vaxInfo.list.map(v => `
-                  <button type="button" class="tag" style="background:#123e37;color:#64e5a0;cursor:pointer;border:1px solid #1c5e53;padding:3px 8px;font-size:10.5px" onclick="window.pickVaxSuggestion('${esc(v.name)}','${esc(v.date)}')">
+                  <button type="button" class="tag" style="background:#123e37;color:#64e5a0;cursor:pointer;border:1px solid #1c5e53;padding:3px 8px;font-size:10.5px" onclick="window.pickVaxSuggestion(decodeURIComponent('${encodeURIComponent(v.name)}'),decodeURIComponent('${encodeURIComponent(v.date)}'))">
                     💉 ${esc(v.name)} ${v.date ? `(${esc(v.date)})` : ''}
                   </button>
                 `).join('')}
@@ -1199,14 +1244,33 @@
       });
     });
 
+    /* [FIX M4] The prepayment recorded when the reservation was created is
+       applied to the release sale here: it is marked 'applied' (excluded from
+       the statements — the release entry is the revenue) and the release
+       transaction carries only the cash actually collected at release. Before
+       this, deposit transaction + full release payment double-counted cash and
+       the deposit stayed a permanent "held" liability. */
+    const depositTxs = (F().transactions || []).filter(t => {
+      if (['applied', 'voided', 'deleted', 'undone'].includes(String(t.status || '').toLowerCase())) return false;
+      const txt = `${String(t.category || '')} ${String(t.description || '')}`.toLowerCase();
+      const key = String(r.no || r.id || '').toLowerCase();
+      return /reservation prepayment|floating reservation deposit|customer deposit/.test(txt) && key && txt.includes(key);
+    });
+    const deposited = depositTxs.reduce((a, t) => a + (+t.amount || 0), 0);
+    depositTxs.forEach(t => {
+      t.status = 'applied';
+      t.applied_to = r.id || r.no;
+      t.applied_at = r.released_at;
+    });
+
     let soldBatchCount = new Set(soldLines.map(L => L.batch_id)).size;
     (F().transactions || (F().transactions = [])).push({
       date: r.released_at.slice(0, 10),
       type: 'Income',
       category: 'Piglet Sales',
-      description: `Reservation ${r.no} · Released ${qty} heads · Tag(s): ${r.tag_no || '—'}${r.weight ? ` · Avg ${r.weight}kg` : ''}${soldBatchCount > 1 ? ` · ${soldBatchCount} batches` : ''}`,
+      description: `Reservation ${r.no} · Released ${qty} heads · Tag(s): ${r.tag_no || '—'}${r.weight ? ` · Avg ${r.weight}kg` : ''}${soldBatchCount > 1 ? ` · ${soldBatchCount} batches` : ''}${deposited ? ` · pre-paid ${peso(deposited)} applied` : ''}`,
       amount: r.total,
-      paid: r.paid
+      paid: Math.max(0, (+r.paid || 0) - deposited)
     });
 
     save();
@@ -1388,13 +1452,16 @@
 
     const rNo = String(r.no || '').trim();
     const rId = String(r.id || '').trim();
-    const rCust = String(r.customer || '').trim();
-
-    // 1. Add to persistent tombstone list so sync never resurrects it
-    F().deleted_ids = F().deleted_ids || [];
-    if (rNo && !F().deleted_ids.includes(rNo)) F().deleted_ids.push(rNo);
-    if (rId && !F().deleted_ids.includes(rId)) F().deleted_ids.push(rId);
-    if (rCust && !F().deleted_ids.includes(rCust)) F().deleted_ids.push(rCust);
+    /* [FIX M9] Reservation tombstones must NOT land in the shared deleted_ids
+       list: semen-reseller cleanup filters THAT list by name, so a customer's
+       name could hide a same-named reseller from the hub. Keep reservations in
+       their own list (legacy farms may still have old names in deleted_ids;
+       the reseller filter now also skips reservation-looking entries). */
+    F().deleted_reservation_ids = F().deleted_reservation_ids || [];
+    if (rNo && !F().deleted_reservation_ids.includes(rNo)) F().deleted_reservation_ids.push(rNo);
+    if (rId && !F().deleted_reservation_ids.includes(rId)) F().deleted_reservation_ids.push(rId);
+    if (rNo && Array.isArray(F().deleted_ids) && !F().deleted_ids.includes(rNo)) F().deleted_ids.push(rNo);
+    if (rId && Array.isArray(F().deleted_ids) && !F().deleted_ids.includes(rId)) F().deleted_ids.push(rId);
 
     // 2. Clean from piglet ledger
     if (Array.isArray(F().pigletLedger)) {

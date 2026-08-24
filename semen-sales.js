@@ -2276,8 +2276,11 @@
     if (!Array.isArray(f.semenResellerTx)) f.semenResellerTx = [];
     if (!Array.isArray(f.semenResellerAdjustments)) f.semenResellerAdjustments = [];
 
-    // Filter out any tombstoned items
-    const deletedSet = new Set((f.deleted_ids || []).map(id => String(id).trim().toLowerCase()));
+    // Filter out any tombstoned items. [FIX M9] reservation numbers (and legacy
+    // customer names written into the shared list by older builds) never hide a
+    // reseller — reservations now tombstone in deleted_reservation_ids and the
+    // shared legacy list only governs reseller records.
+    const deletedSet = new Set((f.deleted_ids || []).map(id => String(id).trim().toLowerCase()).filter(id => id && !/^(RES|FLT)-\d/.test(id) && !/^res-\d+$/.test(id)));
     if (deletedSet.size > 0) {
       f.semenResellers = f.semenResellers.filter(r => {
         if (!r) return false;
@@ -3039,26 +3042,29 @@
     if (!validLines.length) { toast('Please choose at least one valid semen bottle line.'); return; }
     const changedSemenLots = new Set();
 
-    // Deduct stock from available semen
-    validLines.forEach(l => {
+    /* [FIX M8] the old pickup silently clamped stock at 0 (max(0, stock − qty)),
+       so a 50-bottle line against 10 on hand still billed 50 bottles. Validate
+       every line against real on-hand stock before any deduction. */
+    const resolved = [];
+    for (const l of validLines) {
       let s = null;
-      if (l.semen_id) {
-        s = (f.semen || []).find(x => x.id === l.semen_id);
-      }
-      if (!s && l.semen_batch_no) {
-        s = (f.semen || []).find(x => x.semen_batch_no === l.semen_batch_no);
-      }
-      if (!s && l.boar) {
-        s = (f.semen || []).find(x => (x.boar === l.boar || x.boar_name === l.boar) && +(x.available_bottles ?? x.bottles ?? 0) > 0);
-      }
-      if (s) {
-        const remaining = Math.max(0, +(s.available_bottles ?? s.bottles ?? 0) - (+l.qty || 0));
-        s.available_bottles = remaining;
-        s.bottles = remaining;
-        s.updated_at = new Date().toISOString();
-        if (remaining === 0) s.status = 'exhausted';
-        changedSemenLots.add(s);
-      }
+      if (l.semen_id) s = (f.semen || []).find(x => x.id === l.semen_id);
+      if (!s && l.semen_batch_no) s = (f.semen || []).find(x => x.semen_batch_no === l.semen_batch_no);
+      if (!s && l.boar) s = (f.semen || []).find(x => (x.boar === l.boar || x.boar_name === l.boar) && +(x.available_bottles ?? x.bottles ?? 0) > 0);
+      if (!s) { toast(`⚠️ Semen batch for "${l.boar}" could not be found. Re-select the stock lot and try again.`); return; }
+      const stock = Math.max(0, +(s.available_bottles ?? s.bottles ?? 0));
+      if (l.qty > stock) { toast(`⚠️ Only ${stock} bottle(s) on hand for ${s.boar_name || s.boar} — reduce the line quantity (or restock first). Nothing was saved.`); return; }
+      resolved.push({ lot: s, qty: Math.floor(l.qty) });
+    }
+
+    // Deduct stock from available semen (stock already validated)
+    resolved.forEach(({ lot: s, qty }) => {
+      const remaining = Math.max(0, +(s.available_bottles ?? s.bottles ?? 0) - qty);
+      s.available_bottles = remaining;
+      s.bottles = remaining;
+      s.updated_at = new Date().toISOString();
+      if (remaining === 0) s.status = 'exhausted';
+      changedSemenLots.add(s);
     });
 
     const totalAmt = validLines.reduce((acc, l) => acc + (l.amount || 0), 0);
@@ -3265,34 +3271,46 @@
     let newTotal = 0;
     (tx.lines || []).forEach((l, lIdx) => {
       const retQty = Math.max(0, parseInt(d[`ret_qty_${lIdx}`] || 0, 10) || 0);
+      /* [FIX M8] the return/replace form only limited qty by the HTML max
+         attribute — a hand-typed value could return MORE bottles than were ever
+         dispatched. Cap at what is actually returnable. */
+      const alreadyReturned = Math.max(0, +l.returned_qty || 0);
+      const returnable = Math.max(0, (+l.qty || 0) - alreadyReturned);
+      const realRetQty = Math.min(returnable, retQty);
+      if (retQty > returnable) toast(`⚠️ Line ${lIdx + 1}: capped return at ${returnable} bottle(s) (${l.qty} dispatched, ${alreadyReturned} already returned).`);
       const retReason = d[`ret_reason_${lIdx}`] || 'Unused';
       const retAction = d[`ret_action_${lIdx}`] || 'discard';
       const repSemenId = d[`rep_semen_${lIdx}`] || '';
       const repQty = Math.max(0, parseInt(d[`rep_qty_${lIdx}`] || 0, 10) || 0);
       const repRate = Math.max(0, parseFloat(d[`rep_rate_${lIdx}`] || l.rate || 350) || 350);
 
-      l.returned_qty = retQty;
+      l.returned_qty = alreadyReturned + realRetQty;
       l.return_reason = retReason;
       l.return_action = retAction;
 
-      // Handle stock return
-      if (retQty > 0 && retAction === 'restock') {
+      // Handle stock return (uses the validated realRetQty)
+      if (realRetQty > 0 && retAction === 'restock') {
         let s = null;
         if (l.semen_id) s = (f.semen || []).find(x => x.id === l.semen_id);
         if (!s && l.semen_batch_no) s = (f.semen || []).find(x => x.semen_batch_no === l.semen_batch_no);
         if (s) {
-          const restored = +(s.available_bottles !== undefined ? s.available_bottles : (s.bottles || 0)) + retQty;
+          const restored = +(s.available_bottles !== undefined ? s.available_bottles : (s.bottles || 0)) + realRetQty;
           s.available_bottles = restored;
           s.bottles = restored;
           if (s.status === 'exhausted' && restored > 0) s.status = 'active';
         }
       }
 
-      // Handle replacement stock deduction
+      // Handle replacement stock deduction — validate against on-hand before deducting
       if (repQty > 0 && repSemenId) {
         const repSemen = (f.semen || []).find(x => x.id === repSemenId || x.semen_batch_no === repSemenId);
         if (repSemen) {
-          const remaining = Math.max(0, +(repSemen.available_bottles !== undefined ? repSemen.available_bottles : (repSemen.bottles || 0)) - repQty);
+          const repStock = Math.max(0, +(repSemen.available_bottles !== undefined ? repSemen.available_bottles : (repSemen.bottles || 0)));
+          if (repQty > repStock) {
+            toast(`⚠️ Replacement for line ${lIdx + 1}: capped at ${repStock} bottle(s) on hand for ${repSemen.boar_name || repSemen.boar}.`);
+            repQty = repStock;
+          }
+          const remaining = Math.max(0, repStock - repQty);
           repSemen.available_bottles = remaining;
           repSemen.bottles = remaining;
           if (remaining === 0) repSemen.status = 'exhausted';
@@ -3304,12 +3322,12 @@
         }
       }
 
-      if (retQty > 0 || repQty > 0) {
+      if (realRetQty > 0 || repQty > 0) {
         l.is_returned_replaced = true;
       }
 
-      // Re-align line amount
-      const keptQty = Math.max(0, l.qty - retQty);
+      // Re-align line amount (kept = original − cumulative returns)
+      const keptQty = Math.max(0, l.qty - l.returned_qty);
       l.amount = (keptQty * l.rate) + (repQty * repRate);
       newTotal += l.amount;
     });

@@ -118,7 +118,10 @@
     // 2. Total Living Headcount on farm (Heads actually living on farm right now!)
     const aliveM = Math.max(0, m - mortM - soldM);
     const aliveF = Math.max(0, f - mortF - soldF);
-    const aliveAll = aliveM + aliveF;
+    /* [FIX M7] genderless mortality rows (legacy/custom imports) reduce the
+       living herd too; they are drained from the pools and available counts. */
+    const unspecApplied = Math.min(mortUnspec, aliveM + aliveF);
+    const aliveAll = Math.max(0, aliveM + aliveF - unspecApplied);
 
     // 3. Pool Specific Allocations Assigned
     const breederAssignedM = sum("breeder", "male");
@@ -135,8 +138,13 @@
       return Math.max(0, res - can);
     };
 
+    /* [FIX H5] Sold rows are attributed ONLY by their recorded pool source.
+       The old `!x.source && src === 'breeder'` fallback swallowed every
+       source-less (legacy) sold row into the breeder pool, zeroing the breeder
+       pool while those same heads reappeared as "available" — double-bookable.
+       Source-less sales now subtract from the living herd only (soldM/soldF). */
     const sourceSold = (src, gender = "all") => {
-      const sld = l.filter(x => x.type === "sold" && (x.source === src || (!x.source && src === "breeder")) && (gender === "all" || x.gender === gender)).reduce((a, x) => a + (+x.quantity || 0), 0);
+      const sld = l.filter(x => x.type === "sold" && x.source === src && (gender === "all" || x.gender === gender)).reduce((a, x) => a + (+x.quantity || 0), 0);
       return Math.max(sld, releasedFromRes(gender, src));
     };
 
@@ -200,6 +208,22 @@
       unattributedMortF -= dFmF;
     }
 
+    /* [FIX M7] genderless mortality drains the pools (fattener → breeder → farm)
+       before it reduces the open/available counts. */
+    let unsp = unspecApplied;
+    const drainPool = (q, get, set) => {
+      if (unsp <= 0) return q;
+      const d = Math.min(get(q), unsp);
+      unsp -= d;
+      return get(q) - d;
+    };
+    poolFattenerM = drainPool(poolFattenerM, x => x, x => x);
+    poolFattenerF = drainPool(poolFattenerF, x => x, x => x);
+    poolBreederM = drainPool(poolBreederM, x => x, x => x);
+    poolBreederF = drainPool(poolBreederF, x => x, x => x);
+    poolFarmM = drainPool(poolFarmM, x => x, x => x);
+    poolFarmF = drainPool(poolFarmF, x => x, x => x);
+
     // Cap pools by living heads
     poolFattenerM = Math.min(poolFattenerM, aliveM);
     poolFattenerF = Math.min(poolFattenerF, aliveF);
@@ -224,8 +248,13 @@
     const totalLivingAssignedM = poolBreederM + poolFattenerM + poolFarmM;
     const totalLivingAssignedF = poolBreederF + poolFattenerF + poolFarmF;
 
-    const availableM = Math.max(0, aliveM - totalLivingAssignedM - unassignedResM);
-    const availableF = Math.max(0, aliveF - totalLivingAssignedF - unassignedResF);
+    /* [FIX M7] any genderless mortality not yet absorbed by the pools reduces
+       the open counts (males first, then females). */
+    let availableM = Math.max(0, aliveM - totalLivingAssignedM - unassignedResM);
+    let availableF = Math.max(0, aliveF - totalLivingAssignedF - unassignedResF);
+    const availDrain = Math.min(unsp, availableM);
+    availableM = Math.max(0, availableM - availDrain);
+    availableF = Math.max(0, availableF - (unsp - availDrain));
 
     const totalReservedM = sum("reserved", "male") - sum("cancel_reservation", "male");
     const totalReservedF = sum("reserved", "female") - sum("cancel_reservation", "female");
@@ -244,18 +273,24 @@
       breederM: poolBreederM,
       breederF: poolBreederF,
       breederAvail: breederAvailM + breederAvailF,
+      breederAvailM,
+      breederAvailF,
       breederAssigned: breederAssignedM + breederAssignedF,
       // Fattener (Shows living available heads in category)
       fattener: poolFattenerM + poolFattenerF,
       fattenerM: poolFattenerM,
       fattenerF: poolFattenerF,
       fattenerAvail: fattenerAvailM + fattenerAvailF,
+      fattenerAvailM,
+      fattenerAvailF,
       fattenerAssigned: fattenerAssignedM + fattenerAssignedF,
       // Farm Use (Shows living available heads in category)
       farm: poolFarmM + poolFarmF,
       farmM: poolFarmM,
       farmF: poolFarmF,
       farmAvail: farmAvailM + farmAvailF,
+      farmAvailM,
+      farmAvailF,
       farmAssigned: farmAssignedM + farmAssignedF,
       // Total Reserved
       reserved: Math.max(0, totalReservedM + totalReservedF),
@@ -589,6 +624,20 @@
     }
   };
 
+  /* [FIX M1] single source of truth for a batch's living headcount — vaccination
+     prep, medicine dosing, performance ADG and the feeding guide all used their
+     own "born − mortality" formula and forgot sold/released heads. */
+  function liveHeadsFor(b) {
+    if (!b || typeof b !== 'object') return 0;
+    try {
+      const c = counts(b);
+      return Math.max(0, Number(c.alive) || 0);
+    } catch (_) {
+      return Math.max(0, (+b.males || 0) + (+b.females || 0));
+    }
+  }
+  window.liveHeadsFor = liveHeadsFor;
+
   window.openMortality = openMortality;
   window.getPigletCounts = counts;
   window.saveEditBatchTransaction = saveEditBatchTransaction;
@@ -715,6 +764,35 @@
     if (newQty < 1) {
       if (err) { err.textContent = 'Quantity must be at least 1 head.'; err.classList.add('show'); }
       return;
+    }
+
+    /* [FIX M6] re-classifying a transaction must respect the destination pool's
+       live capacity or the batch pools can exceed the living herd and block all
+       future allocations. Allow the row's own current quantity as credit. */
+    const cc = counts(b);
+    const aliveFor = newGender === 'male' ? cc.aliveM : cc.aliveF;
+    if (newQty > aliveFor) {
+      if (err) { err.textContent = `Quantity exceeds living ${newGender} headcount for this batch (${aliveFor} alive).`; err.classList.add('show'); }
+      return;
+    }
+    if (['breeder', 'fattener', 'farm_use', 'reserved'].includes(newType)) {
+      const poolKey = newType === 'reserved' ? null : newType;
+      const existingCredit = x.type === newType ? (+x.quantity || 0) : 0;
+      let capacity;
+      if (poolKey) {
+        const availG = newGender === 'male' ? cc[poolKey + 'AvailM'] : cc[poolKey + 'AvailF'];
+        capacity = (availG || 0) + existingCredit;
+      } else {
+        // reserved draws from the widest open slot of the source pool
+        capacity = Math.max(cc.breederAvail, cc.fattenerAvail, cc.farmAvail) + existingCredit;
+      }
+      if (newQty > capacity) {
+        if (err) {
+          err.textContent = `Only ${capacity} ${newGender} head(s) can move into ${newType.replace('_', ' ')} for this batch. Free a slot first (e.g. cancel a reservation).`;
+          err.classList.add('show');
+        }
+        return;
+      }
     }
 
     // Apply updates
@@ -922,7 +1000,9 @@
       return
     }
     let jid = String(id).split("'").join("\\'"),
-      v = k => String(b[k] ?? ''),
+      /* [FIX L4] value attributes must be escaped (a breed/name with a quote or
+         < could otherwise break the modal markup). */
+      v = k => esc_pe(String(b[k] ?? '')),
       field = (label, inner) => `<div class="field"><label>${label}</label>${inner}</div>`;
     document.body.insertAdjacentHTML('beforeend', `<div class="due-modal-bg" id="pigletEditModal"><form class="reminder-modal perf-modal" onsubmit="savePigletEdits(event,'${jid}')"><div class="modal-top"><div><div class="eyebrow">CORRECT BATCH RECORD</div><h2>✎ Edit ${esc_pe(b.id)}</h2></div><button type="button" class="close-reminder" onclick="document.getElementById('pigletEditModal').remove()">×</button></div><p class="perf-sub">All recorded details of this batch may be corrected. Renaming the Batch ID re-links its ledger, reservations, feed consumption and treatment history automatically.</p><div class="reminder-fields">` +
       field('Batch ID *', `<input name="id" required value="${v('id')}">`) +

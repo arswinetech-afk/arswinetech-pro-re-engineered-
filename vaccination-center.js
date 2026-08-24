@@ -60,6 +60,9 @@
   const findMed = id => medicines().find(m => m.id === id) || null;
 
   function aliveBatchHeads(b) {
+    /* [FIX M1] vaccine doses must be planned on truly living heads — the old
+       formula ignored sold/released piglets and over-prepared doses. */
+    if (window.liveHeadsFor) return Math.max(0, window.liveHeadsFor(b));
     const mort = (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((t, x) => t + (+x.quantity || 0), 0);
     return Math.max(0, (+b.males || 0) + (+b.females || 0) - mort);
   }
