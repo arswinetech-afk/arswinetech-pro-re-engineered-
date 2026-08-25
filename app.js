@@ -1499,9 +1499,17 @@ function production(periodOverride) {
   // 4. 📈 Fattener Market Readiness Events
   (f.piglets || []).forEach(b => {
     if (b.archived || !b.birth) return;
-    const ledger = f.pigletLedger || [];
-    const fattenerEntries = ledger.filter(x => x.batch_id === b.id && x.type === 'fattener' && !['undone', 'deleted'].includes(x.status));
-    const fattenerHeads = fattenerEntries.reduce((a, x) => a + (+x.quantity || 0), 0);
+    /* [FIX FATTENER LIVE COUNTS] market events use the LIVING fattener pool
+       (assigned minus deaths/sales), not the gross allocation — a batch with
+       dead pigs must not show those heads as still eating toward market. */
+    let fattenerHeads = 0;
+    try {
+      fattenerHeads = window.getPigletCounts ? Math.max(0, +window.getPigletCounts(b).fattener || 0) : 0;
+    } catch (_) {}
+    if (!fattenerHeads) {
+      const ledger = f.pigletLedger || [];
+      fattenerHeads = ledger.filter(x => x.batch_id === b.id && x.type === 'fattener' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0);
+    }
     const ageDays = Math.max(0, days(b.birth));
 
     if (fattenerHeads > 0) {

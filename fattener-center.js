@@ -40,13 +40,43 @@
     return acc + (r.batch_id === bid ? (+r.quantity || 0) : 0);
   }, 0);
   const aliveHeads = b => window.getPigletCounts ? window.getPigletCounts(b).alive : Math.max(0, (+b.males || 0) + (+b.females || 0) - tsum(b.id, 'mortality') - Math.max(tsum(b.id, 'sold'), resReleased(b.id)));
-  const assignedG = (b, g) => ledAct().filter(x => x.batch_id === b.id && x.type === 'fattener' && x.gender === g).reduce((a, x) => a + (+x.quantity || 0), 0) -
-    ledAct().filter(x => x.batch_id === b.id && x.type === 'reserved' && x.source === 'fattener' && x.gender === g).reduce((a, x) => a + (+x.quantity || 0), 0) +
-    ledAct().filter(x => x.batch_id === b.id && x.type === 'cancel_reservation' && x.source === 'fattener' && x.gender === g).reduce((a, x) => a + (+x.quantity || 0), 0);
-  const assigned = b => Math.max(0, assignedG(b, 'male') + assignedG(b, 'female'));
-
-  /* Heads counted as "fatteners" for a batch: strictly piglets explicitly allocated to Fattener */
+  /* [FIX FATTENER LIVE COUNTS] "Assigned fattener" must reflect the LIVING
+     fattener pool, adjusted per gender for deaths and sales. The old math only
+     subtracted reservations, so a batch with 10 assigned and 1 death still
+     showed 10 (P4 Charlotte / P00-Aida in the reports). We use the
+     authoritative piglet-ledger count engine — fattenerM/F = allocation minus
+     attributable mortality/sales, minus drained unattributed deaths, capped by
+     the living gender headcount (identical to the Batch Hub "Fattener" stat).
+     Fallback mirrors that when the engine is unavailable. */
+  const fattenerLivingFor = b => {
+    if (window.getPigletCounts && typeof window.getPigletCounts === 'function') {
+      try {
+        const c = window.getPigletCounts(b);
+        if (c && typeof c === 'object') {
+          const m = Math.max(0, +((c.fattenerM ?? c.fattener) || 0)),
+            f = Math.max(0, +((c.fattenerF ?? c.fattener) || 0));
+          return { m, f, total: m + f };
+        }
+      } catch (_) { /* fall through to the ledger-based fallback */ }
+    }
+    const rows = ledAct().filter(x => x.batch_id === b.id);
+    const q = (t, gender, src) => rows.filter(x => x.type === t && x.gender === gender && (!src || x.source === src)).reduce((a, x) => a + (+x.quantity || 0), 0);
+    let m = Math.max(0, q('fattener', 'male') - q('mortality', 'male', 'fattener') - q('sold', 'male', 'fattener'));
+    let f = Math.max(0, q('fattener', 'female') - q('mortality', 'female', 'fattener') - q('sold', 'female', 'fattener'));
+    /* unattributed deaths drain the fattener pool first (fattener → breeder → farm) */
+    let drain = Math.min(rows.filter(x => x.type === 'mortality' && x.gender !== 'male' && x.gender !== 'female').reduce((a, x) => a + (+x.quantity || 0), 0), m + f);
+    const dm = Math.min(m, drain); m -= dm; drain -= dm;
+    f = Math.max(0, f - drain);
+    return { m, f, total: m + f };
+  };
+  window.fattenerLivingFor = fattenerLivingFor;
+  /* assignedG/assigned/herdHeads now all report the LIVING fattener pool */
+  const assignedG = (b, g) => fattenerLivingFor(b)[g === 'male' ? 'm' : 'f'];
+  const assigned = b => fattenerLivingFor(b).total;
   const herdHeads = b => assigned(b);
+
+  /* Heads counted as "fatteners" for a batch: LIVING piglets explicitly
+     allocated to Fattener (deaths/sales already deducted — see above). */
   const lastWeight = b => num(b.release_weight) !== null ? { w: num(b.release_weight), src: 'release avg' }
     : num(b.weaning_weight) !== null ? { w: num(b.weaning_weight), src: 'weaning avg' }
     : num(b.birth_weight) !== null ? { w: num(b.birth_weight), src: 'birth avg' } : null;

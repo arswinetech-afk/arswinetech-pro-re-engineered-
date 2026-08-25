@@ -20,6 +20,7 @@ const loadOrder = [
   'piglet-ledger.js',
   'reservations.js',
   'feeding-guide.js',
+  'fattener-center.js',
   'financial-statements.js'
 ];
 
@@ -389,3 +390,60 @@ describe('ARSwineTech Pro — Feed Predictor vs Feeding Guide consistency (FIX)'
 });
 
 
+
+describe('ARSwineTech Pro — Fattener live-count readjustment (FIX)', () => {
+  const addDays = (base, n) => {
+    const d0 = new Date(base + 'T00:00:00');
+    d0.setDate(d0.getDate() + n);
+    return d0.toISOString().slice(0, 10);
+  };
+  const today = () => (w.window.localToday ? w.window.localToday() : new Date().toISOString().slice(0, 10));
+
+  function seedBatch(males, females, assignedM, assignedF, deaths) {
+    seedFarm();
+    const f = w.DB['farm-1'];
+    f.piglets = [{ id: 'P4', birth: addDays(today(), -52), males, females, breed: 'Terminal', dam_name: 'Charlotte', sire_name: 'Shanks', _ars_cloud_local_id: 'P4' }];
+    f.pigletLedger = [];
+    if (assignedM) f.pigletLedger.push({ id: 'F-M', batch_id: 'P4', type: 'fattener', gender: 'male', quantity: assignedM, status: 'active', source: 'fattener' });
+    if (assignedF) f.pigletLedger.push({ id: 'F-F', batch_id: 'P4', type: 'fattener', gender: 'female', quantity: assignedF, status: 'active', source: 'fattener' });
+    deaths.forEach((d, i) => f.pigletLedger.push({ id: 'M-' + i, batch_id: 'P4', type: 'mortality', gender: d.g, quantity: d.q, status: 'active', source: d.src || 'fattener' }));
+    f.sows = []; f.boars = [];
+    return f;
+  }
+
+  test('P4 Charlotte (screenshot): 5M/5F born, 10 assigned fattener, 1 death → 9 living (per gender)', () => {
+    seedBatch(5, 5, 5, 5, [{ g: 'female', q: 1 }]);
+    const b = w.DB['farm-1'].piglets[0];
+    const counts = w.getPigletCounts(b);
+    const living = w.fattenerLivingFor(b);
+    assert.equal(counts.alive, 9, 'alive 9');
+    assert.equal(living.total, 9, 'assigned fattener adjusts to 9');
+    assert.equal(living.m, 5, 'males still alive');
+    assert.equal(living.f, 4, '1 female death deducted');
+    assert.equal(counts.fattener, living.total, 'fattener center matches batch hub stat');
+  });
+
+  test('P00-Aida (screenshot): 9M/5F born, 14 assigned, 5 female deaths → 9 living', () => {
+    seedBatch(9, 5, 9, 5, [{ g: 'female', q: 5 }]);
+    const b = w.DB['farm-1'].piglets[0];
+    const living = w.fattenerLivingFor(b);
+    assert.equal(living.total, 9, 'assigned fattener adjusts to 9');
+    assert.equal(living.m, 9);
+    assert.equal(living.f, 0);
+  });
+
+  test('unattributed (genderless) deaths drain the fattener pool too', () => {
+    seedBatch(5, 5, 5, 5, [{ g: '', q: 1 }]);
+    const b = w.DB['farm-1'].piglets[0];
+    const living = w.fattenerLivingFor(b);
+    assert.equal(living.total, 9, 'genderless death reduces living fatteners');
+    assert.equal(living.m + living.f, 9);
+  });
+
+  test('fully depleted batch leaves the fattener center (herdHeads = 0)', () => {
+    seedBatch(5, 0, 5, 0, [{ g: 'male', q: 5 }, { g: '', q: 0 }]);
+    const b = w.DB['farm-1'].piglets[0];
+    assert.equal(w.fattenerLivingFor(b).total, 0);
+    assert.equal(w.getPigletCounts(b).fattener, 0);
+  });
+});
