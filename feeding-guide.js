@@ -62,6 +62,37 @@
     return p;
   };
 
+
+  /* [FIX PREDICTOR CONSISTENCY] Age-derived stage progress.
+     A batch with NO manual "consumed bags" entries used to start at Pre Starter
+     no matter how old it really is, so grower/finisher demand was massively
+     under-stated (the guide said "on Pre Starter" for 100-day-old pigs). When
+     the manager has not entered consumption for a batch, derive it from the
+     batch's real age and the configured stage durations instead. */
+  function deriveConsumedFromAge(ageDays, heads, p) {
+    const out = {};
+    let remaining = Math.max(0, +(ageDays || 0));
+    STAGES.forEach(([key]) => {
+      const perHead = num((p.stageBags || {})[key], 0);
+      const sd = Math.max(1, num((p.stageDays || {})[key], 28));
+      const pb = perHead * heads;
+      const day = Math.max(0, Math.min(remaining, sd));
+      out[key] = +(pb * (sd > 0 ? day / sd : 0)).toFixed(2);
+      remaining = Math.max(0, remaining - sd);
+    });
+    return out;
+  }
+  /* consumed source for a batch: manual entries when present, else age-derived */
+  function batchConsumed(p, b, heads) {
+    const saved = (p.batches || {})[b.id] || {};
+    const cons = saved.consumed || {};
+    const hasManual = Boolean(saved.updated) || Object.values(cons).some(v => (+v || 0) > 0);
+    const age = b.birth ? days(b.birth) : null;
+    if (hasManual) return { used: cons, ageDerived: false };
+    if (age === null) return { used: cons, ageDerived: false };
+    return { used: deriveConsumedFromAge(age, heads, p), ageDerived: true };
+  }
+
   /* ── required-bags engine ─────────────────────────────────────────── */
   function computeFeedPlan(days_) {
     /* [REBUILD FIX 50] optional horizon (days) — the dashboard "feed runs short
@@ -115,7 +146,9 @@
          (sold/released heads are no longer fed in the plan). */
       const heads = window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) -
         (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0)),
-        cons = ((p.batches || {})[b.id] || {}).consumed || {},
+        _cons = batchConsumed(p, b, heads),
+        cons = _cons.used,
+        ageDerived = _cons.ageDerived,
         stageData = STAGES.map(([key, label]) => {
           /* plan bags for THIS batch = alive heads × the per-head stage plan */
           const perHead = num((p.stageBags || {})[key], 0),
@@ -140,7 +173,7 @@
       batchSec.push({
         id: b.id, dam: b.dam_name || b.sow || '—', heads, age: b.birth ? days(b.birth) : null,
         stage: curStage ? curStage.label : null, stages: stageData,
-        req: sb, done: curIdx === -1
+        req: sb, done: curIdx === -1, ageDerived: Boolean(ageDerived)
       });
     });
 
@@ -168,7 +201,8 @@
       const heads = window.liveHeadsFor ? Math.max(0, window.liveHeadsFor(b)) : Math.max(0, (+b.males || 0) + (+b.females || 0) -
         (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
     if (heads <= 0) return null;
-    const cons = ((p.batches || {})[b.id] || {}).consumed || {},
+    const _cc = batchConsumed(p, b, heads),
+      cons = _cc.used,
       stageData = STAGES.map(([key, label]) => {
         const perHead = num((p.stageBags || {})[key], 0),
           pb = +(perHead * heads).toFixed(2),
@@ -379,7 +413,8 @@
         (F().pigletLedger || []).filter(x => x.batch_id === b.id && x.type === 'mortality' && !['undone', 'deleted'].includes(x.status)).reduce((a, x) => a + (+x.quantity || 0), 0));
     if (heads <= 0) return '';
 
-    const cons = ((p.batches || {})[b.id] || {}).consumed || {};
+    const _cc2 = batchConsumed(p, b, heads),
+      cons = _cc2.used;
     const stageData = STAGES.map(([key, label]) => {
       const perHead = num((p.stageBags || {})[key], key === 'preStarter' ? 0.8 : (key === 'starter' ? 1.0 : (key === 'grower' ? 2.5 : 0)));
       const pb = +(perHead * heads).toFixed(1);

@@ -930,43 +930,96 @@ function feedStageForAge(age) {
   return 'Finisher';
 }
 
+/* [FIX PREDICTOR CONSISTENCY] The Feed Predictor and the Feeding Guide must be
+   the SAME engine, otherwise the same 30-day window shows 116 bags in one place
+   and 11 bags in the other.
+   • When the feeding guide IS configured, feedForecast() delegates to
+     computeFeedPlan(period): per-batch planned bags/head per stage + the
+     manager's "consumed bags" tracking + sow/boar ration splits. A batch that
+     has already eaten most of its Grower allocation (e.g. ~100-day-old pigs
+     with 90% of their grower plan consumed) only shows the REMAINING grower
+     bags — exactly what the Feeding Guide reports.
+   • When it is NOT configured, the standard age-based engine (fixed kg/head/day
+     by age, market day 160 / breeder release day 90 / 180-day cap) is used as a
+     sensible default, also converted to bags.
+   Both paths return totals in BAGS plus totalsKg so the UI is consistent. */
+  function bagKgOfType(t) {
+    const o = (F().feedPlan && F().feedPlan.bagKg) || {};
+    const key = Object.keys(o).find(k => k.toLowerCase() === String(t).toLowerCase());
+    if (key && +o[key]) return +o[key];
+    return String(t).toLowerCase() === 'pre starter' ? 25 : 50;
+  }
+  window.bagKgOfType = bagKgOfType;
+
+  function emptyFeedTotals() {
+    return { 'Pre Starter': 0, 'Starter': 0, 'Grower': 0, 'Finisher': 0, 'Gestating': 0, 'Lactating': 0 };
+  }
+  function emptyGroups() {
+    return {
+      'Pre Starter': { heads: 0, batches: [] },
+      'Starter': { heads: 0, batches: [] },
+      'Grower': { heads: 0, batches: [] },
+      'Finisher': { heads: 0, batches: [] },
+      'Gestating': { heads: 0, sows: 0, boars: 0 },
+      'Lactating': { heads: 0, sows: 0 }
+    };
+  }
+
 function feedForecast(period = 30) {
   const f = F();
   const todayStr = (typeof TODAY !== 'undefined' ? TODAY : new Date().toISOString().slice(0, 10));
-  const p = (f.feedPlan && f.feedPlan.configured) ? f.feedPlan : {
-    sowGestKg: 2.5,
-    sowLactKg: 3.5,
-    boarKg: 2.0,
-    boarFeedType: 'Gestating'
-  };
-
-  const totals = {
-    'Pre Starter': 0,
-    'Starter': 0,
-    'Grower': 0,
-    'Finisher': 0,
-    'Gestating': 0,
-    'Lactating': 0
-  };
-
-  const consumingGroups = {
-    'Pre Starter': { heads: 0, batches: [] },
-    'Starter': { heads: 0, batches: [] },
-    'Grower': { heads: 0, batches: [] },
-    'Finisher': { heads: 0, batches: [] },
-    'Gestating': { heads: 0, sows: 0, boars: 0 },
-    'Lactating': { heads: 0, sows: 0 }
-  };
-
-  const DEPART_AGE = { fattener: 160, breeder: 90 }; /* market / breeder release (birth + N days) */
-  const MAX_AGE = 180; /* no scheduled departure: keep the old cap for farm-use/unassigned */
-  const RATES = { 'Pre Starter': 0.35, 'Starter': 1.10, 'Grower': 2.10, 'Finisher': 2.75 };
+  const planConfigured = Boolean(f.feedPlan && f.feedPlan.configured);
+  const totals = emptyFeedTotals();   // BAGS
+  const totalsKg = emptyFeedTotals(); // KG
+  const consumingGroups = emptyGroups();
 
   const activeBatches = (f.piglets || []).filter(b => !b.archived && !b.deleted_at);
   const activeSows = (f.sows || []).filter(isActiveSow);
   const activeBoars = (f.boars || []).filter(b => String(b.status || 'Active') === 'Active');
 
-  // Count current population eating each feed today (pool-aware, sold already removed)
+  /* ══ PATH 1 (configured): identical engine to the Feeding Guide ═══════ */
+  if (planConfigured && window.computeFeedPlan && typeof window.computeFeedPlan === 'function') {
+    const c = window.computeFeedPlan(String(period));
+    Object.entries(c.req || {}).forEach(([t, r]) => {
+      const bags = +(r.req || 0);
+      totals[t] = bags;
+      totalsKg[t] = bags * bagKgOfType(t);
+    });
+    (c.batchSec || []).forEach(x => {
+      const label = x.stage;
+      if (!label || x.heads <= 0 || x.done) return;
+      if (!consumingGroups[label]) consumingGroups[label] = { heads: 0, batches: [] };
+      consumingGroups[label].heads += x.heads;
+      consumingGroups[label].batches.push({ id: x.id, age: x.age, heads: x.heads, breed: x.dam || '', req: x.req, stage: label, ageDerived: x.ageDerived });
+    });
+    if (c.sowSec) {
+      consumingGroups['Gestating'].sows = c.sowSec.gestNow || 0;
+      consumingGroups['Lactating'].sows = c.sowSec.lactNow || 0;
+      consumingGroups['Gestating'].heads += c.sowSec.gestNow || 0;
+      consumingGroups['Lactating'].heads += c.sowSec.lactNow || 0;
+    }
+    if (c.boarSec && c.boarSec.active) {
+      const bt = c.boarSec.type || 'Gestating';
+      if (!consumingGroups[bt]) consumingGroups[bt] = { heads: 0, batches: [] };
+      consumingGroups[bt].boars = (consumingGroups[bt].boars || 0) + c.boarSec.active;
+      consumingGroups[bt].heads += c.boarSec.active;
+      if (bt !== 'Gestating') consumingGroups['Gestating'].boars = 0; // boars on their own ration
+    }
+    return { totals, totalsKg, consumingGroups, activeBatches, activeSows, activeBoars, engine: 'guide', guide: c };
+  }
+
+  /* ══ PATH 2 (not configured): age-based standard-rate simulation ══════ */
+  const p = {
+    sowGestKg: (f.feedPlan && f.feedPlan.sowGestKg) || 2.5,
+    sowLactKg: (f.feedPlan && f.feedPlan.sowLactKg) || 3.5,
+    boarKg: (f.feedPlan && f.feedPlan.boarKg) || 2.0,
+    boarFeedType: (f.feedPlan && f.feedPlan.boarFeedType) || 'Gestating'
+  };
+  const DEPART_AGE = { fattener: 160, breeder: 90 }; /* market / breeder release (birth + N days) */
+  const MAX_AGE = 180;
+  const RATES = { 'Pre Starter': 0.35, 'Starter': 1.10, 'Grower': 2.10, 'Finisher': 2.75 };
+
+  // Today's population by age stage (pool-aware, sold already removed)
   activeBatches.forEach(b => {
     const age = days(b.birth);
     const pools = feedPoolsForBatch(b);
@@ -976,7 +1029,6 @@ function feedForecast(period = 30) {
     consumingGroups[stage].heads += batchHeads;
     consumingGroups[stage].batches.push({ id: b.id, age, heads: batchHeads, breed: b.breed, pools });
   });
-
   activeSows.forEach(s => {
     const st = status(s);
     if (st === 'Lactating' || (s.insemination && days(s.insemination) >= 110)) {
@@ -987,15 +1039,12 @@ function feedForecast(period = 30) {
       consumingGroups['Gestating'].heads++;
     }
   });
-
   consumingGroups['Gestating'].boars += activeBoars.length;
   consumingGroups['Gestating'].heads += activeBoars.length;
 
-  // Day-by-day progression simulation across the forecast horizon
+  const kgTotals = emptyFeedTotals();
   for (let dayOffset = 0; dayOffset < period; dayOffset++) {
-    // 1. Batches day-by-day stage transition — pool by pool, removing heads on
-    //    their scheduled market (fattener, d160) / breeder release (d90) day so
-    //    bags are never computed for animals already off the farm.
+    // 1. Batches day-by-day, pool by pool; fattener leaves at 160, breeder at 90
     activeBatches.forEach(b => {
       const simAge = days(b.birth) + dayOffset;
       const pools = feedPoolsForBatch(b);
@@ -1003,38 +1052,32 @@ function feedForecast(period = 30) {
         const h = Math.max(0, +heads || 0);
         if (h <= 0) return;
         const depart = DEPART_AGE[pool];
-        if (depart && simAge >= depart) return;               // off the farm this day
-        if (!depart && simAge > MAX_AGE) return;               // legacy cap for stayers
-        if (simAge < 5 || simAge > MAX_AGE) return;            // grain-off window & cap
+        if (depart && simAge >= depart) return;
+        if (!depart && simAge > MAX_AGE) return;
+        if (simAge < 5 || simAge > MAX_AGE) return;
         const stage = feedStageForAge(simAge);
-        totals[stage] += h * RATES[stage];
+        kgTotals[stage] += h * RATES[stage];
       });
     });
-
-    // 2. Sows day-by-day transition (Day 110 gestating -> lactating)
+    // 2. Sows: gestating → lactating at day 110
     activeSows.forEach(s => {
       const st = status(s);
-      if (st === 'Lactating') {
-        totals['Lactating'] += (p.sowLactKg || 3.5);
-      } else if (s.insemination) {
-        const simGestation = days(s.insemination) + dayOffset;
-        if (simGestation >= 110) {
-          totals['Lactating'] += (p.sowLactKg || 3.5);
-        } else {
-          totals['Gestating'] += (p.sowGestKg || 2.5);
-        }
-      } else {
-        totals['Gestating'] += (p.sowGestKg || 2.5);
-      }
+      if (st === 'Lactating') kgTotals['Lactating'] += (p.sowLactKg || 3.5);
+      else if (s.insemination) {
+        if (days(s.insemination) + dayOffset >= 110) kgTotals['Lactating'] += (p.sowLactKg || 3.5);
+        else kgTotals['Gestating'] += (p.sowGestKg || 2.5);
+      } else kgTotals['Gestating'] += (p.sowGestKg || 2.5);
     });
-
-    // 3. Boars daily intake
-    if (activeBoars.length > 0) {
-      totals['Gestating'] += activeBoars.length * (p.boarKg || 2.0);
-    }
+    // 3. Boars
+    if (activeBoars.length > 0) kgTotals[p.boarFeedType || 'Gestating'] += activeBoars.length * (p.boarKg || 2.0);
   }
-
-  return { totals, consumingGroups, activeBatches, activeSows, activeBoars };
+  Object.entries(kgTotals).forEach(([t, kg]) => {
+    if (kg > 0) {
+      totals[t] = +(kg / bagKgOfType(t)).toFixed(2);
+      totalsKg[t] = kg;
+    }
+  });
+  return { totals, totalsKg, consumingGroups, activeBatches, activeSows, activeBoars, engine: 'age' };
 }
 
 function predictor(period = 30) {
@@ -1069,8 +1112,10 @@ function predictor(period = 30) {
   let criticalAlertCount = 0;
 
   const analyzedFeeds = feedPrograms.map(fp => {
-    const reqKg = t[fp.type] || 0;
-    const reqBags = +(reqKg / fp.bagKg).toFixed(1);
+    /* [FIX PREDICTOR CONSISTENCY] totals are now BAGS (same engine as the
+       Feeding Guide); totalsKg keeps the kg figure for burn-rate labels. */
+    const reqBags = +(t[fp.type] || 0);
+    const reqKg = +(sim.totalsKg && sim.totalsKg[fp.type] || reqBags * fp.bagKg);
     const stockItem = (f.feed || []).find(x => String(x.type).toLowerCase() === fp.type.toLowerCase());
     const stockBags = stockItem ? +stockItem.bags || 0 : 0;
     const price = stockItem ? +stockItem.price || fp.defaultPrice : fp.defaultPrice;
@@ -1140,7 +1185,7 @@ function predictor(period = 30) {
         <div>
           <div class="eyebrow" style="color:var(--teal2);font-weight:800">FEED REQUIREMENTS &amp; CONSUMPTION PATTERN PREDICTOR</div>
           <h2 style="margin:2px 0 6px 0;font-size:24px">Feed Predictor &amp; Inventory Demand Forecast</h2>
-          <p class="muted" style="margin:0">Real-time consumption simulation based on active herd population, daily burn rates, age-stage transitions &amp; stock-out forecasting.</p>
+          <p class="muted" style="margin:0">Real-time consumption simulation based on active herd population, daily burn rates and stage transitions — matched to your Feeding Guide plan (&quot;consumed bags&quot; per batch) when the guide is configured. Stock-out forecasting included.</p>
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           ${window.feedOrdersPageBtn ? window.feedOrdersPageBtn() : ''}
@@ -1197,7 +1242,9 @@ function predictor(period = 30) {
         <span style="font-size:18px">📊</span>
         <div>
           <b>Real-Time Population &amp; Consumption Pattern Analysis</b>
-          <small class="muted" style="display:block">Simulates daily age progression across <b>${sim.activeBatches.length} active litters</b> (${totalPigletsHeads} heads) + <b>${sim.activeSows.length} sows</b> (switching to Lactating feed at Day 110) + <b>${sim.activeBoars.length} boars</b>. Fattener-assigned heads leave the simulation at <b>market day 160</b> and breeder-assigned heads at <b>release day 90</b>, so bags are never projected for animals already sold within the horizon.</small>
+          <small class="muted" style="display:block">${sim.engine === 'guide'
+            ? `Uses the same per-batch stage-plan engine as the Feeding Guide: <b>${sim.activeBatches.length} active litters</b> (${totalPigletsHeads} heads) + <b>${sim.activeSows.length} sows</b> (switching to Lactating feed at Day 110) + <b>${sim.activeBoars.length} boars</b>, with each batch's planned bags/head per stage and your "consumed bags" updates — so Grower demand only counts the grower ration still remaining per batch.`
+            : `Standard age-based simulation across <b>${sim.activeBatches.length} active litters</b> (${totalPigletsHeads} heads) + <b>${sim.activeSows.length} sows</b> (switching to Lactating feed at Day 110) + <b>${sim.activeBoars.length} boars</b>. Fattener-assigned heads leave the simulation at <b>market day 160</b> and breeder-assigned heads at <b>release day 90</b>, so bags are never projected for animals already sold within the horizon.`}</small>
         </div>
       </div>
       ${criticalAlertCount > 0 ? `

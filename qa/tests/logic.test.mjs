@@ -19,6 +19,7 @@ const loadOrder = [
   'app.js',
   'piglet-ledger.js',
   'reservations.js',
+  'feeding-guide.js',
   'financial-statements.js'
 ];
 
@@ -304,69 +305,87 @@ describe('ARSwineTech Pro — financial aggregates (real financial-statements.js
   });
 });
 
-describe('ARSwineTech Pro — Feed Predictor Grower/departure math (FIX feed predictor)', () => {
+describe('ARSwineTech Pro — Feed Predictor vs Feeding Guide consistency (FIX)', () => {
   const addDays = (base, n) => {
     const d0 = new Date(base + 'T00:00:00');
     d0.setDate(d0.getDate() + n);
     return d0.toISOString().slice(0, 10);
   };
 
-  function fattenedFarm(ageDays, heads, opts = {}) {
+  function freshBatchFarm(ageDays, heads, opts = {}) {
     seedFarm();
-    const today = w.window.localToday();
+    const today = w.window.localToday ? w.window.localToday() : new Date().toISOString().slice(0, 10);
     const birth = addDays(today, -ageDays);
     const f = w.DB['farm-1'];
-    f.piglets = [{ id: 'B-F', birth, males: heads, females: 0, breed: 'Crossbred', dam_name: 'Bella', sire_name: 'Thor', weaning: false }];
+    f.piglets = [{ id: 'B-F', birth, males: heads, females: 0, breed: 'Crossbred', dam_name: 'Bella', sire_name: 'Thor', weaning: false, _ars_cloud_local_id: 'B-F' }];
     f.pigletLedger = [{ id: 'LF-1', batch_id: 'B-F', type: 'fattener', gender: 'male', quantity: heads, status: 'active', source: 'fattener' }];
     if (opts.sold) f.pigletLedger.push({ id: 'LF-2', batch_id: 'B-F', type: 'sold', gender: 'male', quantity: opts.sold, status: 'active', source: 'fattener' });
-    f.sows = []; // isolate the batch math from sow/boar demand
+    f.sows = [];
     f.boars = [];
+    if (opts.configured === false && f.feedPlan) f.feedPlan.configured = false;
     return { f, birth };
   }
 
-  test('[FIX] fattener at age 100 within 90d: leaves at day 160 — grower only 21 days, finisher only 39 days', () => {
-    const { f } = fattenedFarm(100, 10);
-    const fc = w.feedForecast(90);
-    const growerKg = fc.totals['Grower'];
-    const finisherKg = fc.totals['Finisher'];
-    // days 100..120 = 21 grower days × 10 heads × 2.1 kg
-    assert.ok(Math.abs(growerKg - 21 * 10 * 2.1) < 0.01, `grower ${growerKg} ≈ 441`);
-    // days 121..159 = 39 finisher days × 10 × 2.75 (departed at day 160 — NOT 180)
-    assert.ok(Math.abs(finisherKg - 39 * 10 * 2.75) < 0.01, `finisher ${finisherKg} ≈ 1072.5`);
-  });
-
-  test('[FIX] fattener at age 140 (past grower): NO grower bags at all; 20 finisher days then gone', () => {
-    fattenedFarm(140, 10);
+  test('[FIX] configured farm: feedForecast === computeFeedPlan (one engine, one number)', () => {
+    freshBatchFarm(100, 10);
     const fc = w.feedForecast(30);
-    assert.equal(fc.totals['Grower'], 0, 'already past grower → zero grower bags');
-    assert.ok(Math.abs(fc.totals['Finisher'] - 20 * 10 * 2.75) < 0.01, 'only days 140..159 before market');
+    const gp = w.computeFeedPlan(30);
+    assert.equal(fc.engine, 'guide', 'configured farm uses the guide engine');
+    Object.keys(gp.req).forEach(t => {
+      const expected = +(gp.req[t].req || 0);
+      assert.ok(Math.abs((fc.totals[t] || 0) - expected) < 0.01, `${t}: predictor ${fc.totals[t]} must equal guide ${expected}`);
+    });
   });
 
-  test('[FIX] breeder batch at age 85: grower only 6 days (released at day 90)', () => {
+  test('[FIX] age-derived progress: 45-day-old batch (no consumed entry) is NOT stuck on Pre Starter', () => {
+    freshBatchFarm(45, 10);
+    const f = w.DB['farm-1'];
+    delete f.feedPlan.batches; // no consumed data at all
+    const gp = w.computeFeedPlan(30);
+    const b = gp.batchSec.find(x => x.id === 'B-F');
+    assert.ok(b, 'batch present');
+    assert.equal(b.ageDerived, true, 'consumed derived from real age');
+    assert.notEqual(b.stage, 'Pre Starter', '45-day-old pigs are past Pre Starter (28d)');
+    // preStarter fully consumed, starter partially → current stage Starter
+    assert.equal(b.stage, 'Starter');
+  });
+
+  test('[FIX] grower remaining respects consumed tracking (100d pig, grown plan coded)', () => {
     seedFarm();
-    const today = w.window.localToday();
-    const birth = addDays(today, -85);
+    const today = w.window.localToday ? w.window.localToday() : new Date().toISOString().slice(0, 10);
+    const birth = addDays(today, -100);
     const f = w.DB['farm-1'];
-    f.piglets = [{ id: 'B-B', birth, males: 0, females: 10, breed: 'F1', dam_name: 'Bella', sire_name: 'Thor', weaning: false }];
-    f.pigletLedger = [{ id: 'LB-1', batch_id: 'B-B', type: 'breeder', gender: 'female', quantity: 10, status: 'active', source: 'breeder' }];
+    f.piglets = [{ id: 'B-G', birth, males: 10, females: 0, breed: 'Crossbred', _ars_cloud_local_id: 'B-G' }];
+    f.pigletLedger = [{ id: 'L-G1', batch_id: 'B-G', type: 'fattener', gender: 'male', quantity: 10, status: 'active', source: 'fattener' }];
     f.sows = []; f.boars = [];
+    // MANUAL consumed: pre+starter done, grower 17 of 20 bags (2.0/head × 10)
+    f.feedPlan.batches = { 'B-G': { consumed: { preStarter: 8, starter: 12, grower: 17, finisher: 0 }, updated: new Date().toISOString() } };
     const fc = w.feedForecast(30);
-    assert.ok(Math.abs(fc.totals['Grower'] - 5 * 10 * 2.1) < 0.01, `grower ${fc.totals['Grower']} ≈ 105 (ages 85-89; day 90 is the release day)`);
-    assert.equal(fc.totals['Finisher'], 0, 'no finisher — released at day 90');
+    const gp = w.computeFeedPlan(30);
+    assert.ok(Math.abs(fc.totals['Grower'] - +(gp.req['Grower']?.req || 0)) < 0.01);
+    // 3 bags of grower remain → 30d walk = 3 bags (not 60+ bags as the old age engine said)
+    assert.ok(Math.abs(fc.totals['Grower'] - 3) < 0.05, `grower remaining should be 3 bags, got ${fc.totals['Grower']}`);
   });
 
-  test('[FIX] unassigned/farm-use batch keeps the old 180-day cap (no departure scheduled)', () => {
-    fattenedFarm(100, 10);
+  test('[FIX] unconfigured farm falls back to age-based engine (market day 160 still respected)', () => {
+    freshBatchFarm(100, 10, { configured: false });
+    const fc = w.feedForecast(90);
+    assert.equal(fc.engine, 'age');
+    // days 100-120 grower × 10 × 2.1kg
+    assert.ok(Math.abs(fc.totalsKg['Grower'] - 21 * 10 * 2.1) < 0.01, `grower kg ${fc.totalsKg['Grower']}`);
+    // days 121-159 finisher (market at 160)
+    assert.ok(Math.abs(fc.totalsKg['Finisher'] - 39 * 10 * 2.75) < 0.01, `finisher kg ${fc.totalsKg['Finisher']}`);
+  });
+
+  test('[FIX] unconfigured breeder batch released at day 90: grower only 71-89', () => {
+    freshBatchFarm(85, 10, { configured: false });
     const f = w.DB['farm-1'];
-    f.pigletLedger[0].type = 'farm_use'; // stays on farm
-    const fc = w.feedForecast(90);
-    assert.ok(Math.abs(fc.totals['Grower'] - 21 * 10 * 2.1) < 0.01, 'grower unchanged');
-    assert.ok(Math.abs(fc.totals['Finisher'] - 60 * 10 * 2.75) < 0.01, 'finisher capped at 180 days (60 days 121..180)');
-  });
-
-  test('[FIX] sold heads are excluded from the forecast headcount', () => {
-    fattenedFarm(100, 10, { sold: 4 });
-    const fc = w.feedForecast(90);
-    assert.ok(Math.abs(fc.totals['Grower'] - 21 * 6 * 2.1) < 0.01, '6 living fattener heads only');
+    f.pigletLedger[0].type = 'breeder';
+    f.pigletLedger[0].source = 'breeder';
+    const fc = w.feedForecast(30);
+    assert.ok(Math.abs(fc.totalsKg['Grower'] - 5 * 10 * 2.1) < 0.01, `grower kg ${fc.totalsKg['Grower']}`);
+    assert.equal(fc.totalsKg['Finisher'], 0);
   });
 });
+
+

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARSwineTech Pro — Download Build</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: linear-gradient(160deg, #061419 0%, #0a242b 100%);
+    color: #e6f2f1; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .card { width: 100%; max-width: 560px; background: rgba(10, 32, 38, .85); border: 1px solid #1a4a4f; border-radius: 18px; padding: 28px 26px; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+  .eyebrow { color: #2dd4bf; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+  h1 { font-size: 24px; margin: 6px 0 4px; }
+  p { color: #9fc7c4; font-size: 14px; line-height: 1.55; margin: 10px 0; }
+  .file { background: #0c2a30; border: 1px dashed #2b6a6f; border-radius: 12px; padding: 14px; margin: 16px 0; }
+  .file b { font-size: 15px; word-break: break-all; }
+  .file small { display: block; color: #7fb0ad; margin-top: 4px; }
+  .download {
+    display: block; text-align: center; text-decoration: none; background: linear-gradient(135deg,#0d9e94,#078f83);
+    color: #fff; font-size: 17px; font-weight: 800; padding: 16px; border-radius: 12px; margin: 6px 0 10px;
+    box-shadow: 0 8px 24px rgba(13,158,148,.35);
+  }
+  .download:hover { filter: brightness(1.08); }
+  .note { font-size: 12px; color: #7fb0ad; }
+  .steps { counter-reset: s; }
+  .steps li { list-style: none; counter-increment: s; display: flex; gap: 10px; margin: 7px 0; font-size: 14px; color: #cfe7e5; }
+  .steps li::before { content: counter(s); background: #11393f; border: 1px solid #2b6a6f; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #2dd4bf; flex: none; }
+  .tag { background: rgba(45,212,191,.12); border: 1px solid rgba(45,212,191,.35); color: #5eead4; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="eyebrow">ARSwineTech Pro · Updated Build</div>
+  <h1>Download the PWA for Cloudflare</h1>
+  <p>Latest build with all fixes (Feed Predictor grower/market math, conflict review, offline delete queue, date &amp; pedigree fixes). Your Supabase URL &amp; publishable key are already inside.</p>
+
+  <div class="file">
+    <b>ARSwineTech-Pro-PWA-updated.zip</b>
+    <small>1.2 MB · 60 files · MD5 8ee4ecc4bac61d43206554c5656711bc</small>
+  </div>
+
+  <a class="download" href="./ARSwineTech-Pro-PWA-updated.zip" download>⬇️ Download ARSwineTech-Pro-PWA-updated.zip</a>
+  <p class="note">If the download doesn't start, use: <a href="./ARSwineTech-Pro-PWA-updated.zip?dl=1" style="color:#5eead4">direct link</a></p>
+
+  <b style="font-size:13px;color:#2dd4bf">Upload to Cloudflare in 3 steps</b>
+  <ol class="steps">
+    <li>Unzip the downloaded file — you get a folder with <code>index.html</code>, <code>css/</code>, <code>js/</code>, <code>supabase/</code>, <code>assets/</code>, <code>icons/</code>.</li>
+    <li>Cloudflare dashboard → <b>Workers &amp; Pages → Create → Pages → Upload assets</b>.</li>
+    <li>Drag the unzipped <b>folder</b> in and click <b>Deploy</b>. (Open the site once and hard-refresh with Ctrl+Shift+R.)</li>
+  </ol>
+  <p class="note" style="margin-top:14px">Cloudflare's Pages "Upload assets" accepts the unzipped folder directly — the zip is your download/transfer file.</p>
+</div>
+</body>
+</html>
